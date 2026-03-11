@@ -1,1 +1,15 @@
-.
+Title: Stress Test Failure: Timeout fatal error when sending 10,000 MEM Transaction on outbond & inbound
+
+Test variant(Failing): tl_traffic_dw_vip_wire_flit_vtb
+Test variant(Passing): tl_traffic_dw_vdut_wire_flit_vtb
+Config: 
+
+Description: Simulation fails during 10,000 mixed Mem transactions (UIO/non-UIO) due to outstanding inbound transactions, followed by a VIP timeout.
+Debug Analysis:
+	Transaction: MEM_RD_64, Tag: 1bc5.
+	Flow: 
+		1. The request was successfully generated and observed at : u_dwc_pcie_rx_adm (radm_trg1). 
+		2. The transaction was successfully tracked moving into the inbound  : u_DWC_pcie_app_ib. 
+		3. Response visible on AXI channel.
+	Failure: No completion observed on u_xali_cpl ( u_DWC_pcie_app_ib) or in vtb_trans_log.
+
