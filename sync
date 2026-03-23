@@ -1,5 +1,12 @@
 #!/bin/bash
 
+QSIM_PATH="verification/workspaces/my_project"
+
+SANITY_LIST=(
+    "axi_reset_test"
+    "interrupt_sanity"
+)
+
 # ==========================================================
 # FUNCTION: Perforce Sync Logic
 # ==========================================================
@@ -43,7 +50,16 @@ run_single_test() {
     fi
     echo "SUCCESS: $USER_TEST passed."
 }
-
+# ==========================================================
+# 4. FUNCTION: Sanity Suite
+# ==========================================================
+run_sanity_suite() {
+    for TEST in "${SANITY_LIST[@]}"; do
+        make qsim $QSIM_PATH QTEST=$TEST
+        [[ $? -ne 0 ]] && echo "Sanity Fail: $TEST" && exit 1
+    done
+    echo "All Sanity Tests Passed!"
+}
 # ==========================================================
 # EXECUTION CONTROL
 # ==========================================================
@@ -58,9 +74,13 @@ case "$1" in
         shift 
         run_single_test "$1" "$2"
         ;;
+    "sanity")
+        run_sanity_suite
+        ;;
     *)
         echo "Usage Options:"
         echo "  $0 sync                  (To sync P4)"
         echo "  $0 test <path> <test>    (To run a specific test)"
+        echo "  $0 sanity                 - Run the sanity column"
         ;;
 esac
