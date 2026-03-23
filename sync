@@ -1,0 +1,66 @@
+#!/bin/bash
+
+# ==========================================================
+# FUNCTION: Perforce Sync Logic
+# ==========================================================
+run_sync_check() {
+    echo "---------------------------------------------------"
+    echo "Checking for Perforce Updates..."
+    p4 sync -n
+    read -p "Sync workspace now? (y/n): " sync_choice
+    if [[ "$sync_choice" =~ ^[yY]$ ]]; then
+        p4 sync
+    fi
+}
+
+# ==========================================================
+# FUNCTION: Dynamic QSIM Test (Takes 2 Arguments)
+# ==========================================================
+run_single_test() {
+    local USER_PATH=$1
+    local USER_TEST=$2
+
+    if [[ -z "$USER_PATH" || -z "$USER_TEST" ]]; then
+        echo "Error: You must provide both a PATH and a TEST name."
+        echo "Usage: $0 test <path> <testname>"
+        exit 1
+    fi
+
+    echo "---------------------------------------------------"
+    echo "Running Custom Test"
+    echo "Path: $USER_PATH"
+    echo "Test: $USER_TEST"
+    echo "---------------------------------------------------"
+
+    FULL_COMMAND="make qsim $USER_PATH QTEST=$USER_TEST"
+    
+    echo ">> Executing: $FULL_COMMAND"
+    $FULL_COMMAND
+
+    if [ $? -ne 0 ]; then
+        echo "FAILURE: $USER_TEST failed."
+        exit 1
+    fi
+    echo "SUCCESS: $USER_TEST passed."
+}
+
+# ==========================================================
+# EXECUTION CONTROL
+# ==========================================================
+
+case "$1" in
+    "sync")
+        run_sync_check
+        ;;
+    "test")
+        # Shift removes "test" from the arguments, 
+        # so $2 becomes $1 for the function
+        shift 
+        run_single_test "$1" "$2"
+        ;;
+    *)
+        echo "Usage Options:"
+        echo "  $0 sync                  (To sync P4)"
+        echo "  $0 test <path> <test>    (To run a specific test)"
+        ;;
+esac
