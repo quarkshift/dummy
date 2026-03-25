@@ -12,19 +12,22 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 
-# ---------- Improved Parsing patterns ----------
+# ---------- Deep Scan Patterns ----------
 DB_OK_STR = "database successfully generated"
 ERR_PATTERN = re.compile(r"Error-\[", re.IGNORECASE)
-UVM_ERR_PATTERN = re.compile(r"\bUVM_ERROR\b")
-UVM_FATAL_PATTERN = re.compile(r"\bUVM_FATAL\b")
-# Catch SVA errors specifically (flexible regex)
-SVA_PATTERN = re.compile(r"(SVA checker: ERROR|SVA.*error)", re.IGNORECASE)
+
+# This pattern is now very aggressive to catch SVA in the middle of lines
+# It catches: UVM_ERROR, UVM_FATAL, SVA checker: ERROR, Assertion Failed, SVA Error, etc.
+CHECKER_PATTERN = re.compile(
+    r"(\bUVM_ERROR\b|\bUVM_FATAL\b|SVA.*ERROR|SVA.*FAIL|\bASSERTION.*FAIL\b)", 
+    re.IGNORECASE
+)
 
 
 @dataclass
 class CompileResult:
     lp: str
-    status: str              # PASS/FAIL/NA
+    status: str
     log_path: Optional[Path]
     errors: List[str]
     chosen_dir: Optional[str]
@@ -33,59 +36,41 @@ class CompileResult:
 @dataclass
 class TestResult:
     test_dir: str
-    status: str              # PASS/FAIL/RUNNING/UNKNOWN
-    log_messages: List[str]  # Combined UVM and SVA messages
+    status: str
+    log_messages: List[str]
     log_path: Optional[Path]
 
 
 # ----------------- Log helpers -----------------
-def safe_read_lines(log_path: Path, max_bytes: int = 10_000_000) -> List[str]:
+def safe_read_lines(log_path: Path) -> List[str]:
+    """Reads the entire log file to ensure errors in the middle are not missed."""
     try:
         if not log_path.exists():
             return []
-        with log_path.open("rb") as f:
-            data = f.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            data = data[:max_bytes]
-        return data.decode(errors="replace").splitlines()
-    except (FileNotFoundError, OSError):
-        return []
+        # We use 'errors="replace"' to handle non-ascii characters often found in logs
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+    except Exception:
+        # Fallback to binary if encoding fails
+        try:
+            with log_path.open("rb") as f:
+                return f.read().decode(errors="replace").splitlines()
+        except:
+            return []
 
 
-def second_last_nonempty_line_contains(lines: List[str], needle: str) -> bool:
-    trimmed = [l for l in lines if l.strip()]
-    if not trimmed:
-        return False
-    if len(trimmed) < 2:
-        return needle in trimmed[-1]
-    return needle in trimmed[-2]
-
-
-def extract_compile_errors(lines: List[str], max_lines: int = 30) -> List[str]:
-    errs = [l.strip() for l in lines if ERR_PATTERN.search(l)]
-    seen = set()
-    uniq: List[str] = []
-    for e in errs:
-        if e not in seen:
-            uniq.append(e)
-            seen.add(e)
-        if len(uniq) >= max_lines:
-            break
-    return uniq
-
-
-def extract_checker_messages(lines: List[str], max_lines: int = 50) -> List[str]:
-    """Extracts both UVM_ERROR/FATAL and SVA checker errors."""
+def extract_checker_messages(lines: List[str], max_errors: int = 100) -> List[str]:
+    """Scans every single line for UVM or SVA errors."""
     msgs: List[str] = []
     for line in lines:
-        if UVM_ERR_PATTERN.search(line) or UVM_FATAL_PATTERN.search(line) or SVA_PATTERN.search(line):
+        if CHECKER_PATTERN.search(line):
             msgs.append(line.strip())
-        if len(msgs) >= max_lines:
+        if len(msgs) >= max_errors:
             break
     return msgs
 
 
-# ----------------- Discover regression structure -----------------
+# ----------------- Discovery logic -----------------
 def discover_configs(reg_root: Path) -> List[Path]:
     if not reg_root.is_dir():
         return []
@@ -124,48 +109,44 @@ def compile_status_for_lp(sim_dir: Path, lp: str) -> CompileResult:
     log_path = chosen / "test.log"
     lines = safe_read_lines(log_path)
 
-    if second_last_nonempty_line_contains(lines, DB_OK_STR):
-        return CompileResult(lp=lp, status="PASS",
-                             log_path=log_path if log_path.exists() else None,
-                             errors=[], chosen_dir=chosen.name)
+    # Check for success string in the last few lines
+    success = False
+    for l in lines[-5:]:
+        if DB_OK_STR in l.lower():
+            success = True
+            break
 
-    errs = extract_compile_errors(lines)
-    return CompileResult(lp=lp, status="FAIL",
-                         log_path=log_path if log_path.exists() else None,
-                         errors=errs, chosen_dir=chosen.name)
+    if success:
+        return CompileResult(lp=lp, status="PASS", log_path=log_path, errors=[], chosen_dir=chosen.name)
 
-
-def find_test_dirs(sim_dir: Path) -> List[Path]:
-    if not sim_dir.is_dir():
-        return []
-    out = []
-    for p in sim_dir.iterdir():
-        if not p.is_dir(): continue
-        if p.name.startswith("compile_dw_"): continue
-        if "vtb" not in p.name.lower(): continue
-        out.append(p)
-    return sorted(out, key=lambda x: x.name)
+    errs = [l.strip() for l in lines if ERR_PATTERN.search(l)][:20]
+    return CompileResult(lp=lp, status="FAIL", log_path=log_path, errors=errs, chosen_dir=chosen.name)
 
 
 def parse_test_results(sim_dir: Path) -> List[TestResult]:
+    """Finds all test directories and scans logs for failures."""
     results: List[TestResult] = []
-    for tdir in find_test_dirs(sim_dir):
+    
+    # Identify test folders (those with 'vtb' and not 'compile')
+    test_paths = [p for p in sim_dir.iterdir() if p.is_dir() and "vtb" in p.name.lower() and not p.name.startswith("compile")]
+    
+    for tdir in sorted(test_paths, key=lambda x: x.name):
         log_path = tdir / "test.log"
-        
-        # 1. Read the log first to find SVA/UVM errors
         found_msgs = []
+        
+        # 1. SCAN LOG (Deep scan)
         if log_path.exists():
             lines = safe_read_lines(log_path)
             found_msgs = extract_checker_messages(lines)
 
-        # 2. Determine state based on text content OR markers
+        # 2. DETERMINE STATUS
         if found_msgs:
             state = "FAIL"
         elif (tdir / "passed").exists():
             state = "PASS"
         elif (tdir / "failed").exists():
             state = "FAIL"
-            found_msgs = ["(No UVM/SVA text found, but 'failed' marker exists)"]
+            found_msgs = ["(No error text found, but 'failed' marker exists)"]
         elif (tdir / "compile_passed").exists():
             state = "RUNNING"
         else:
@@ -175,156 +156,125 @@ def parse_test_results(sim_dir: Path) -> List[TestResult]:
             test_dir=tdir.name,
             status=state,
             log_messages=found_msgs,
-            log_path=log_path if log_path.exists() else None,
+            log_path=log_path if log_path.exists() else None
         ))
     return results
 
 
-def is_config_compile_clean(vdut: CompileResult, vip: CompileResult) -> bool:
-    return (vdut.status == "PASS") and (vip.status == "PASS")
-
-
-# ----------------- Cell builders -----------------
-def build_compilation_cell(today: str, comp: CompileResult) -> str:
-    lines: List[str] = [today, f"Compilation: {comp.status}"]
-    if comp.chosen_dir:
-        lines.append(f"Info: dir={comp.chosen_dir}")
-    if comp.status == "FAIL":
-        if comp.errors:
-            lines.append("Errors:")
-            for i, e in enumerate(comp.errors[:10], start=1):
-                lines.append(f"  {i}) {e}")
-    return "\n".join(lines)
-
-
-def build_run_cell(today: str, tests: List[TestResult], compile_clean: bool) -> str:
-    if not compile_clean:
-        return "\n".join([today, "Run Summary: SKIPPED (compile not clean)"])
-
-    pass_cnt = sum(1 for t in tests if t.status == "PASS")
-    fail_cnt = sum(1 for t in tests if t.status == "FAIL")
-    run_cnt = sum(1 for t in tests if t.status == "RUNNING")
-    unk_cnt = sum(1 for t in tests if t.status == "UNKNOWN")
-
-    lines: List[str] = [
-        today,
-        f"Run Summary: TOTAL={len(tests)} PASS={pass_cnt} FAIL={fail_cnt} RUNNING={run_cnt} UNKNOWN={unk_cnt}"
-    ]
-
-    failing = [t for t in tests if t.status == "FAIL"]
-    if failing:
-        lines.append("Failures (UVM/SVA):")
-        for i, t in enumerate(failing, start=1):
-            lines.append(f"{i}) {t.test_dir}")
-            for j, msg in enumerate(t.log_messages, start=1):
-                lines.append(f"    {j}. {msg}")
-
-    running = [t for t in tests if t.status == "RUNNING"]
-    if running:
-        lines.append("Running:")
-        for i, r in enumerate(running, start=1):
-            lines.append(f"{i}) {r.test_dir}")
-
-    return "\n".join(lines)
-
-
-# ----------------- Excel writer -----------------
+# ----------------- Excel & Formatting -----------------
 def write_excel(out_path: Path, configs_data: Dict[str, Dict]) -> None:
     wb = Workbook()
     ws = wb.active
-    ws.title = "Summary"
+    ws.title = "Regression Summary"
 
-    header_font = Font(bold=True)
+    # Styles
+    hdr_f = Font(bold=True, color="FFFFFF")
+    hdr_fill = PatternFill("solid", fgColor="4F81BD")
     center = Alignment(vertical="center", horizontal="center", wrap_text=True)
-    left_top = Alignment(vertical="top", horizontal="left", wrap_text=True)
-    thin = Side(style="thin")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    top_left = Alignment(vertical="top", horizontal="left", wrap_text=True)
+    border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
 
-    pass_fill = PatternFill("solid", fgColor="C6EFCE")
-    fail_fill = PatternFill("solid", fgColor="FFC7CE")
-    run_fill = PatternFill("solid", fgColor="FFF2CC")
-    na_fill = PatternFill("solid", fgColor="E7E6E6")
-
-    def get_fill(text: str) -> PatternFill:
-        t = text.upper()
-        if "COMPILATION: FAIL" in t or "FAILURES" in t: return fail_fill
-        if "RUNNING=" in t and "RUNNING=0" not in t: return run_fill
-        if "PASS=" in t and "FAIL=0" in t and "RUNNING=0" in t: return pass_fill
-        if "COMPILATION: PASS" in t: return pass_fill
-        return na_fill
-
-    ws.append(["CONFIG NAME", "LP", "Type", "Status Details"])
-    for c in range(1, 5):
-        cell = ws.cell(row=1, column=c)
-        cell.font, cell.alignment, cell.border = header_font, center, border
+    ws.append(["CONFIG NAME", "LP", "SECTION", "DETAILS"])
+    for cell in ws[1]:
+        cell.font, cell.fill, cell.alignment, cell.border = hdr_f, hdr_fill, center, border
 
     row = 2
-    for cfg_name in sorted(configs_data.keys()):
-        cfg_start = row
+    for cfg in sorted(configs_data.keys()):
+        start_cfg = row
         for lp in ["VDUT", "VIP"]:
-            lp_start = row
-            # Compilation Row
-            comp_txt = configs_data[cfg_name]["comp_cells"][lp]
-            ws.append([cfg_name, lp, "Compilation", comp_txt])
-            ws.cell(row=row, column=4).fill = get_fill(comp_txt)
+            start_lp = row
+            
+            # Compilation
+            comp_txt = configs_data[cfg]["comp_cells"][lp]
+            ws.append([cfg, lp, "Compilation", comp_txt])
+            c = ws.cell(row=row, column=4)
+            c.fill = PatternFill("solid", fgColor="FFC7CE" if "FAIL" in comp_txt.upper() else "C6EFCE")
             row += 1
-            # Run Row
-            run_txt = configs_data[cfg_name]["run_cells"][lp]
-            ws.append(["", "", "Simulation", run_txt])
-            ws.cell(row=row, column=4).fill = get_fill(run_txt)
+
+            # Simulation
+            sim_txt = configs_data[cfg]["run_cells"][lp]
+            ws.append(["", "", "Simulation", sim_txt])
+            c = ws.cell(row=row, column=4)
+            # Color logic for Sim
+            if "FAILURES (UVM/SVA):" in sim_txt.upper(): c.fill = PatternFill("solid", fgColor="FFC7CE")
+            elif "RUNNING=" in sim_txt and "RUNNING=0" not in sim_txt: c.fill = PatternFill("solid", fgColor="FFF2CC")
+            elif "PASS=" in sim_txt: c.fill = PatternFill("solid", fgColor="C6EFCE")
             row += 1
-            ws.merge_cells(start_row=lp_start, start_column=2, end_row=row-1, end_column=2)
+
+            ws.merge_cells(start_row=start_lp, start_column=2, end_row=row-1, end_column=2)
         
-        ws.merge_cells(start_row=cfg_start, start_column=1, end_row=row-1, end_column=1)
-        ws.append([]) # spacer
+        ws.merge_cells(start_row=start_cfg, start_column=1, end_row=row-1, end_column=1)
+        ws.append([]) # Spacer row
         row += 1
 
+    # Final formatting
     for r in range(1, ws.max_row + 1):
-        for c in range(1, 5):
-            cell = ws.cell(row=r, column=c)
+        for col in range(1, 5):
+            cell = ws.cell(row=r, column=col)
             cell.border = border
-            cell.alignment = center if c < 4 else left_top
+            cell.alignment = center if col < 4 else top_left
 
-    ws.column_dimensions["A"].width = 25
+    ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 10
     ws.column_dimensions["C"].width = 15
-    ws.column_dimensions["D"].width = 100
+    ws.column_dimensions["D"].width = 110
     wb.save(out_path)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("regression_path")
-    ap.add_argument("-o", "--out", default=None)
-    args = ap.parse_args()
+def build_run_cell(today: str, tests: List[TestResult], clean: bool) -> str:
+    if not clean: return f"{today}\nSKIPPED: Compilation failed."
+    if not tests: return f"{today}\nNo tests found."
 
-    reg_root = Path(args.regression_path).resolve()
-    out_path = Path(args.out).resolve() if args.out else (reg_root / "regression_summary.xlsx")
+    p, f, r, u = sum(t.status=="PASS" for t in tests), sum(t.status=="FAIL" for t in tests), \
+                 sum(t.status=="RUNNING" for t in tests), sum(t.status=="UNKNOWN" for t in tests)
+    
+    lines = [today, f"Summary: TOTAL={len(tests)} PASS={p} FAIL={f} RUNNING={r} UNKNOWN={u}"]
+    
+    fail_list = [t for t in tests if t.status == "FAIL"]
+    if fail_list:
+        lines.append("\nFAILURES (UVM/SVA):")
+        for i, t in enumerate(fail_list, 1):
+            lines.append(f"{i}) {t.test_dir}")
+            for j, msg in enumerate(t.log_messages[:10], 1): # Max 10 msgs per test
+                lines.append(f"   {j}. {msg}")
+    
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", help="Regression root path")
+    parser.add_argument("-o", "--out", help="Output file name")
+    args = parser.parse_args()
+
+    root = Path(args.path).resolve()
+    output = Path(args.out).resolve() if args.out else root / "regression_summary.xlsx"
     today = dt.date.today().isoformat()
 
-    configs = discover_configs(reg_root)
-    configs_data = {}
+    configs = discover_configs(root)
+    data = {}
 
-    for cfg_dir in configs:
-        sim_dir = cfg_dir / "sim"
-        vdut_comp = compile_status_for_lp(sim_dir, "VDUT")
-        vip_comp = compile_status_for_lp(sim_dir, "VIP")
-        clean = is_config_compile_clean(vdut_comp, vip_comp)
-        tests = parse_test_results(sim_dir) if clean else []
+    for cfg in configs:
+        sim = cfg / "sim"
+        vdut_c = compile_status_for_lp(sim, "VDUT")
+        vip_c = compile_status_for_lp(sim, "VIP")
+        
+        is_clean = (vdut_c.status == "PASS" and vip_c.status == "PASS")
+        tests = parse_test_results(sim) if is_clean else []
 
-        configs_data[cfg_dir.name] = {
+        data[cfg.name] = {
             "comp_cells": {
-                "VDUT": build_compilation_cell(today, vdut_comp),
-                "VIP": build_compilation_cell(today, vip_comp),
+                "VDUT": f"{today}\nStatus: {vdut_c.status}\nDir: {vdut_c.chosen_dir}\n" + "\n".join(vdut_c.errors),
+                "VIP": f"{today}\nStatus: {vip_c.status}\nDir: {vip_c.chosen_dir}\n" + "\n".join(vip_c.errors),
             },
             "run_cells": {
-                "VDUT": build_run_cell(today, tests, clean),
-                "VIP": build_run_cell(today, tests, clean),
+                "VDUT": build_run_cell(today, tests, is_clean),
+                "VIP": build_run_cell(today, tests, is_clean),
             }
         }
 
-    write_excel(out_path, configs_data)
-    print(f"Done! Report: {out_path}")
+    write_excel(output, data)
+    print(f"Report generated successfully: {output}")
 
 if __name__ == "__main__":
     main()
