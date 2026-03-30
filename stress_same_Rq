@@ -1,0 +1,19 @@
+Title: Stress Test Failure: Timeout fatal error when sending 10,000 MEM Transaction on outbond & inbound
+
+Issue Summary:
+Initial debug of a bvalid UVM error for UIO_WR revealed that the Inbound Bridge is registering the same request twice. While two identical headers are observed in the bridge, only a single physical completion is returned.
+
+Config:
+Test variant(Failing): tl_traffic_dw_vip_wire_flit_vtb
+
+Debug Analysis :
+	1. Request Gen: UIO_WR successfully generated at uvip master[5] (AXI).
+	2. Outbound Export: Verified successfully at u_vip DWC_pcie_app_ob (xali_client_uio_p).
+	3. DUT Entrance: Request observed entering the DUT via u_DWC_pcie_rx_adm (radm_trgt1_p0).
+	4. Bridge Anomaly: In DWC_pcie_App_ib (inbs_header), the same request appears twice with identical:
+		○ Tag: 52b
+		○ Address: Identical
+		○ Lookup ID: 17f
+	5. Completion Path: Inbound completion finally observed at DWC_pcie_App_ib (inb xali_client_cpl0).
+	6. Verification: Final outbound completion verified at u_vip (radam_trgt1_cpl_0).
+	7. The Hang: Simulation sticks immediately after this last completion.
