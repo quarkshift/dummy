@@ -1,19 +1,18 @@
-Title: Stress Test Failure: Timeout fatal error when sending 10,000 MEM Transaction on outbond & inbound
+Test ran: [Name/Number]
 
-Issue Summary:
-Initial debug of a bvalid UVM error for UIO_WR revealed that the Inbound Bridge is registering the same request twice. While two identical headers are observed in the bridge, only a single physical completion is returned.
+Config: [Config Name]
 
-Config:
-Test variant(Failing): tl_traffic_dw_vip_wire_flit_vtb
+Path location: [Path]
 
-Debug Analysis :
-	1. Request Gen: UIO_WR successfully generated at uvip master[5] (AXI).
-	2. Outbound Export: Verified successfully at u_vip DWC_pcie_app_ob (xali_client_uio_p).
-	3. DUT Entrance: Request observed entering the DUT via u_DWC_pcie_rx_adm (radm_trgt1_p0).
-	4. Bridge Anomaly: In DWC_pcie_App_ib (inbs_header), the same request appears twice with identical:
-		○ Tag: 52b
-		○ Address: Identical
-		○ Lookup ID: 17f
-	5. Completion Path: Inbound completion finally observed at DWC_pcie_App_ib (inb xali_client_cpl0).
-	6. Verification: Final outbound completion verified at u_vip (radam_trgt1_cpl_0).
-	7. The Hang: Simulation sticks immediately after this last completion.
+Description: Simulation failed due to a timeout while waiting for BVALID.
+
+Debug Analysis:
+
+1.AXI Master Request: A UIO_WR transaction was initiated from u_dut AXI master[5] with addr('h10dafaf) and awid('hc8).
+2.The transaction was successfully tracked in u_DWC_pcie_app_ob (XALI) with addr('h10d_afac) and tlp_tag(15e). This is confirmed in both the waveform and dut_XadmXtlh_trans.log.
+3.Completion Observation: Completion was observed in the u_DWC_pcie_app_ob radm_trgt_cpl waveform and verified in dut_RadmRtrgt1_trans.log.
+4.Abnormal Behavior: * tlp_abort is asserted high on the waveform for this transaction.
+	A similar tlp_abort was previously observed for a UIO_RD request at addr('h10d0440) with arid('he).
+5.On the AXI master[5] B-channel, the BID is visible, but BVALID fails to assert.
+	It's also observed that for all cpl_requests where tlp_abort is high, BVALID remains de-asserted.
+
